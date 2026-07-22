@@ -20,6 +20,7 @@ import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.time.Duration
 import javax.swing.JButton
 import javax.swing.JCheckBox
 import javax.swing.JLabel
@@ -97,8 +98,13 @@ private class QwenAssistantPanel(private val project: Project) : JPanel(BorderLa
     }
 
     private fun sendRequest() {
+        // Swing/editor values EDT par hi read karo. Background thread se UI access unstable ho sakta hai.
         val key = String(apiKey.password).trim()
         val userPrompt = prompt.text.trim()
+        val endpointBase = baseUrl.text.trim()
+        val modelId = model.text.trim()
+        val context = if (includeEditor.isSelected) editorContext() else ""
+
         if (key.isBlank()) {
             output.text = "Bedrock API key dalo."
             return
@@ -107,16 +113,28 @@ private class QwenAssistantPanel(private val project: Project) : JPanel(BorderLa
             output.text = "Prompt likho."
             return
         }
+        if (endpointBase.isBlank()) {
+            output.text = "Base URL blank nahi ho sakta."
+            return
+        }
+        if (modelId.isBlank()) {
+            output.text = "Model ID blank nahi ho sakta."
+            return
+        }
 
         PasswordSafe.instance.set(credentialAttributes(), Credentials("bedrock", key))
         send.isEnabled = false
         output.text = "Qwen se response aa raha hai..."
 
+        val finalPrompt = if (context.isBlank()) {
+            userPrompt
+        } else {
+            "$userPrompt\n\nAndroid Studio editor context:\n```\n$context\n```"
+        }
+
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
-                val context = if (includeEditor.isSelected) editorContext() else ""
-                val finalPrompt = if (context.isBlank()) userPrompt else "$userPrompt\n\nAndroid Studio editor context:\n```\n$context\n```"
-                val answer = callBedrock(key, finalPrompt)
+                val answer = callBedrock(key, endpointBase, modelId, finalPrompt)
                 SwingUtilities.invokeLater {
                     output.text = answer
                     output.caretPosition = 0
@@ -134,32 +152,49 @@ private class QwenAssistantPanel(private val project: Project) : JPanel(BorderLa
     private fun editorContext(): String {
         val editor = FileEditorManager.getInstance(project).selectedTextEditor ?: return ""
         val selected = editor.selectionModel.selectedText
-        return selected ?: editor.document.text.take(30000)
+        return (selected ?: editor.document.text).take(MAX_CONTEXT_CHARS)
     }
 
-    private fun callBedrock(key: String, message: String): String {
-        val endpoint = baseUrl.text.trim().trimEnd('/') + "/chat/completions"
-        val body = """{"model":"${jsonEscape(model.text.trim())}","messages":[{"role":"user","content":"${jsonEscape(message)}"}],"max_tokens":4096}"""
+    private fun callBedrock(
+        key: String,
+        endpointBase: String,
+        modelId: String,
+        message: String
+    ): String {
+        val endpoint = endpointBase.trimEnd('/') + "/chat/completions"
+        val body = """{"model":"${jsonEscape(modelId)}","messages":[{"role":"user","content":"${jsonEscape(message)}"}],"max_tokens":4096}"""
+
         val request = HttpRequest.newBuilder()
             .uri(URI.create(endpoint))
+            .timeout(Duration.ofMinutes(3))
             .header("Authorization", "Bearer $key")
             .header("Content-Type", "application/json")
             .POST(HttpRequest.BodyPublishers.ofString(body))
             .build()
-        val response = HttpClient.newBuilder().build().send(request, HttpResponse.BodyHandlers.ofString())
+
+        val client = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(30))
+            .build()
+
+        val response = client.send(request, HttpResponse.BodyHandlers.ofString())
         if (response.statusCode() !in 200..299) {
-            throw IllegalStateException("HTTP ${response.statusCode()}: ${response.body()}")
+            throw IllegalStateException("HTTP ${response.statusCode()}: ${response.body().take(2000)}")
         }
-        return extractContent(response.body())
+
+        return extractContent(response.body()).ifBlank {
+            throw IllegalStateException("Bedrock ne empty response diya.")
+        }
     }
 
     private fun insertResponse() {
         val text = output.text
-        if (text.isBlank()) return
+        if (text.isBlank() || text.startsWith("Error:") || text == "Qwen se response aa raha hai...") return
+
         val editor = FileEditorManager.getInstance(project).selectedTextEditor ?: run {
             output.text = "Pehle editor me koi file kholo.\n\n$text"
             return
         }
+
         WriteCommandAction.runWriteCommandAction(project) {
             val selection = editor.selectionModel
             if (selection.hasSelection()) {
@@ -189,10 +224,15 @@ private class QwenAssistantPanel(private val project: Project) : JPanel(BorderLa
         val marker = "\"content\""
         var index = json.indexOf(marker)
         if (index < 0) return json
-        index = json.indexOf(':', index + marker.length) + 1
+
+        index = json.indexOf(':', index + marker.length)
+        if (index < 0) return json
+        index++
+
         while (index < json.length && json[index].isWhitespace()) index++
         if (index >= json.length || json[index] != '"') return json
         index++
+
         val result = StringBuilder()
         while (index < json.length) {
             val c = json[index++]
@@ -202,6 +242,7 @@ private class QwenAssistantPanel(private val project: Project) : JPanel(BorderLa
                 continue
             }
             if (index >= json.length) break
+
             when (val escaped = json[index++]) {
                 'n' -> result.append('\n')
                 'r' -> result.append('\r')
@@ -213,7 +254,8 @@ private class QwenAssistantPanel(private val project: Project) : JPanel(BorderLa
                 '/' -> result.append('/')
                 'u' -> {
                     if (index + 4 <= json.length) {
-                        result.append(json.substring(index, index + 4).toInt(16).toChar())
+                        val hex = json.substring(index, index + 4)
+                        result.append(hex.toIntOrNull(16)?.toChar() ?: "\\u$hex")
                         index += 4
                     }
                 }
@@ -221,5 +263,9 @@ private class QwenAssistantPanel(private val project: Project) : JPanel(BorderLa
             }
         }
         return result.toString()
+    }
+
+    companion object {
+        private const val MAX_CONTEXT_CHARS = 30_000
     }
 }

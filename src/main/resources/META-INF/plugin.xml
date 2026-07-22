@@ -1,0 +1,17 @@
+<idea-plugin>
+    <id>com.ankit.qwenbedrock.assistant</id>
+    <name>Qwen Bedrock Assistant</name>
+    <vendor email="ankitjaatkyamsar@gmail.com">Ankit</vendor>
+    <description><![CDATA[
+        Qwen coding assistant for Android Studio and IntelliJ IDEA using Amazon Bedrock Mantle.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="Qwen Assistant"
+                    anchor="right"
+                    factoryClass="com.ankit.qwenbedrock.QwenToolWindowFactory"
+                    canCloseContents="false"/>
+    </extensions>
+</idea-plugin>
